@@ -131,6 +131,7 @@ extern "C" {
 #include <time.h>
 
 #include <esp_timer.h>
+#include <esp_random.h>
 
 #define MG_PATH_MAX 128
 

@@ -5046,7 +5046,8 @@ size_t mg_tls_pending(struct mg_connection *c) {
 
 #if MG_ENABLE_MBEDTLS
 
-#if defined(MBEDTLS_VERSION_NUMBER) && MBEDTLS_VERSION_NUMBER >= 0x03000000
+#if defined(MBEDTLS_VERSION_NUMBER) && MBEDTLS_VERSION_NUMBER >= 0x03000000 && \
+    !defined(MBEDTLS_USE_PSA_CRYPTO)
 #define MGRNG , rng_get, NULL
 #else
 #define MGRNG
@@ -5112,11 +5113,13 @@ void mg_tls_handshake(struct mg_connection *c) {
   }
 }
 
+#if !defined(MBEDTLS_USE_PSA_CRYPTO)
 static int mbed_rng(void *ctx, unsigned char *buf, size_t len) {
   mg_random(buf, len);
   (void) ctx;
   return 0;
 }
+#endif
 
 static void debug_cb(void *c, int lev, const char *s, int n, const char *s2) {
   n = (int) strlen(s2) - 1;
@@ -5124,7 +5127,8 @@ static void debug_cb(void *c, int lev, const char *s, int n, const char *s2) {
   (void) s;
 }
 
-#if defined(MBEDTLS_VERSION_NUMBER) && MBEDTLS_VERSION_NUMBER >= 0x03000000
+#if defined(MBEDTLS_VERSION_NUMBER) && MBEDTLS_VERSION_NUMBER >= 0x03000000 && \
+    !defined(MBEDTLS_USE_PSA_CRYPTO)
 static int rng_get(void *p_rng, unsigned char *buf, size_t len) {
   (void) p_rng;
   mg_random(buf, len);
@@ -5165,7 +5169,9 @@ void mg_tls_init(struct mg_connection *c, const struct mg_tls_opts *opts) {
     mg_error(c, "tls defaults %#x", -rc);
     goto fail;
   }
+#if !defined(MBEDTLS_USE_PSA_CRYPTO)
   mbedtls_ssl_conf_rng(&tls->conf, mbed_rng, c);
+#endif
   if (opts->ca == NULL || strcmp(opts->ca, "*") == 0) {
     mbedtls_ssl_conf_authmode(&tls->conf, MBEDTLS_SSL_VERIFY_NONE);
   } else if (opts->ca != NULL && opts->ca[0] != '\0') {
