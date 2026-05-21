@@ -19,6 +19,18 @@
 
 #include "mongoose.h"
 
+/* lwip fallback DNS: quand le socket UDP de Mongoose expire (Thread/NAT64,
+ * source link-local non routable par NAT64), on reessaie via getaddrinfo()
+ * de lwip qui utilise l'adresse OMR directement. Pour les hotes A-only on
+ * synthetise l'adresse NAT64 depuis les 96 premiers bits du serveur dns6.
+ * IDF_VER est toujours defini dans les builds ESP-IDF. */
+#ifdef IDF_VER
+#  include "lwip/netdb.h"
+#  include "lwip/sockets.h"
+#  include "lwip/dns.h"
+#  define MG_LWIP_DNS_FALLBACK 1
+#endif
+
 #ifdef MG_ENABLE_LINES
 #line 1 "src/base64.c"
 #endif
@@ -122,6 +134,9 @@ struct dns_data {
   struct mg_connection *c;
   uint64_t expire;
   uint16_t txnid;
+#ifdef MG_LWIP_DNS_FALLBACK
+  char name[256];  /* copie du hostname pour la resolution lwip de secours */
+#endif
 };
 
 static void mg_sendnsreq(struct mg_connection *, struct mg_str *, int,
@@ -245,6 +260,66 @@ bool mg_dns_parse(const uint8_t *buf, size_t len, struct mg_dns_message *dm) {
   return true;
 }
 
+#ifdef MG_LWIP_DNS_FALLBACK
+/* Resolve d->name via lwip getaddrinfo (uses OMR src addr, not link-local).
+ * On success fills d->c->rem with the IPv6 address and returns true.
+ * Caller must call mg_connect_resolved + mg_dns_free. */
+static bool mg_lwip_try_resolve(struct dns_data *d) {
+  if (d->name[0] == '\0') return false;
+  struct addrinfo hints, *res = NULL;
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family   = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  if (getaddrinfo(d->name, NULL, &hints, &res) != 0 || res == NULL) return false;
+  uint16_t saved_port = d->c->rem.port;
+  struct addrinfo *ai;
+  uint8_t ipv4_bytes[4];
+  bool got_inet6 = false, got_inet = false;
+  for (ai = res; ai != NULL; ai = ai->ai_next) {
+    if (ai->ai_family == AF_INET6 && !got_inet6) {
+      struct sockaddr_in6 *sa6 = (struct sockaddr_in6 *) ai->ai_addr;
+      memset(&d->c->rem, 0, sizeof(d->c->rem));
+      d->c->rem.is_ip6 = true;
+      memcpy(d->c->rem.ip6, &sa6->sin6_addr, 16);
+      d->c->rem.port   = saved_port;
+      got_inet6 = true;
+      break;
+    } else if (ai->ai_family == AF_INET && !got_inet) {
+      struct sockaddr_in *sa4 = (struct sockaddr_in *) ai->ai_addr;
+      memcpy(ipv4_bytes, &sa4->sin_addr.s_addr, 4);
+      got_inet = true;
+    }
+  }
+  freeaddrinfo(res);
+  if (!got_inet6 && got_inet) {
+    const ip_addr_t *nat64_dns = dns_getserver(0);
+    if (nat64_dns != NULL && IP_IS_V6_VAL(*nat64_dns)) {
+      char dns_diag[46] = {0};
+      inet_ntop(AF_INET6, ip_2_ip6(nat64_dns)->addr, dns_diag, sizeof(dns_diag));
+      MG_ERROR(("DNS fallback: NAT64 via dns[0]=%s ipv4=%u.%u.%u.%u",
+                dns_diag, ipv4_bytes[0], ipv4_bytes[1], ipv4_bytes[2], ipv4_bytes[3]));
+      const ip6_addr_t *pfx = ip_2_ip6(nat64_dns);
+      memset(&d->c->rem, 0, sizeof(d->c->rem));
+      d->c->rem.is_ip6 = true;
+      memcpy(d->c->rem.ip6,      pfx->addr, 12);
+      memcpy(d->c->rem.ip6 + 12, ipv4_bytes, 4);
+      d->c->rem.port   = saved_port;
+      got_inet6 = true;
+    } else {
+      MG_ERROR(("DNS fallback: no IPv6 dns[0] for NAT64 synthesis"));
+    }
+  }
+  if (got_inet6 && d->c->is_resolving) {
+    char ip_diag[46] = {0};
+    inet_ntop(AF_INET6, d->c->rem.ip6, ip_diag, sizeof(ip_diag));
+    MG_ERROR(("%lu DNS lwip fallback: %s -> [%s]:%u",
+              d->c->id, d->name, ip_diag, (unsigned) mg_ntohs(d->c->rem.port)));
+    return true;
+  }
+  return false;
+}
+#endif /* MG_LWIP_DNS_FALLBACK */
+
 static void dns_cb(struct mg_connection *c, int ev, void *ev_data,
                    void *fn_data) {
   struct dns_data *d, *tmp;
@@ -254,7 +329,18 @@ static void dns_cb(struct mg_connection *c, int ev, void *ev_data,
          d = tmp) {
       tmp = d->next;
       // MG_DEBUG ("%lu %lu dns poll", d->expire, now));
-      if (now > d->expire) mg_error(d->c, "DNS timeout");
+      if (now > d->expire) {
+#ifdef MG_LWIP_DNS_FALLBACK
+        if (mg_lwip_try_resolve(d)) {
+          mg_connect_resolved(d->c);
+          mg_dns_free(c, d);
+        } else {
+          mg_error(d->c, "DNS timeout");
+        }
+#else
+        mg_error(d->c, "DNS timeout");
+#endif
+      }
     }
   } else if (ev == MG_EV_READ) {
     struct mg_dns_message dm;
@@ -284,7 +370,15 @@ static void dns_cb(struct mg_connection *c, int ev, void *ev_data,
             mg_sendnsreq(d->c, &x, c->mgr->dnstimeout, &c->mgr->dns6, true);
 #endif
           } else {
+#ifdef MG_LWIP_DNS_FALLBACK
+            if (mg_lwip_try_resolve(d)) {
+              mg_connect_resolved(d->c);
+            } else {
+              mg_error(d->c, "%s DNS lookup failed", dm.name);
+            }
+#else
             mg_error(d->c, "%s DNS lookup failed", dm.name);
+#endif
           }
         } else {
           MG_ERROR(("%lu already resolved", d->c->id));
@@ -358,6 +452,12 @@ static void mg_sendnsreq(struct mg_connection *c, struct mg_str *name, int ms,
     d->expire = mg_millis() + (uint64_t) ms;
     d->c = c;
     c->is_resolving = 1;
+#ifdef MG_LWIP_DNS_FALLBACK
+    if (name->len < sizeof(d->name)) {
+      memcpy(d->name, name->ptr, name->len);
+      d->name[name->len] = '\0';
+    }
+#endif
     MG_VERBOSE(("%lu resolving %.*s @ %s, txnid %hu", c->id, (int) name->len,
                 name->ptr, mg_ntoa(&dnsc->c->rem, buf, sizeof(buf)), d->txnid));
     if (!mg_dns_send(dnsc->c, name, d->txnid, ipv6)) {

@@ -5,11 +5,26 @@
 #include "url.h"
 #include "util.h"
 
+/* lwip fallback DNS: when Mongoose's UDP DNS socket times out (e.g. on
+ * Thread/NAT64 where the BSD socket source address is link-local and NAT64
+ * cannot route the response back), we retry using lwip's internal DNS API
+ * which uses the OMR (ULA) address and succeeds where the socket path fails.
+ * For A-only hosts we synthesize the NAT64 address from the /96 prefix
+ * that is embedded in the configured DNS64 server address. */
+#ifdef MG_LWIP_DNS_FALLBACK
+#  include "lwip/netdb.h"
+#  include "lwip/sockets.h"
+#  include "lwip/dns.h"
+#endif
+
 struct dns_data {
   struct dns_data *next;
   struct mg_connection *c;
   uint64_t expire;
   uint16_t txnid;
+#ifdef MG_LWIP_DNS_FALLBACK
+  char name[256];  /* hostname copy for lwip fallback resolution */
+#endif
 };
 
 static void mg_sendnsreq(struct mg_connection *, struct mg_str *, int,
@@ -142,7 +157,68 @@ static void dns_cb(struct mg_connection *c, int ev, void *ev_data,
          d = tmp) {
       tmp = d->next;
       // MG_DEBUG ("%lu %lu dns poll", d->expire, now));
-      if (now > d->expire) mg_error(d->c, "DNS timeout");
+      if (now > d->expire) {
+#ifdef MG_LWIP_DNS_FALLBACK
+        /* lwip fallback: Mongoose's UDP DNS socket times out on Thread/NAT64
+         * because BSD socket source-address selection may pick a link-local
+         * fe80:: address that NAT64 cannot route responses back to.
+         * lwip's internal getaddrinfo() uses the OMR address directly.
+         * For A-only hosts we synthesize the NAT64-mapped IPv6 address from
+         * the /96 prefix embedded in the configured dns6 server address. */
+        bool fallback_ok = false;
+        if (d->name[0] != '\0') {
+          struct addrinfo hints, *res = NULL;
+          memset(&hints, 0, sizeof(hints));
+          hints.ai_family   = AF_UNSPEC;
+          hints.ai_socktype = SOCK_STREAM;
+          if (getaddrinfo(d->name, NULL, &hints, &res) == 0 && res != NULL) {
+            uint16_t saved_port = d->c->rem.port;
+            struct addrinfo *ai;
+            uint8_t ipv4_bytes[4];
+            bool got_inet6 = false, got_inet = false;
+            for (ai = res; ai != NULL; ai = ai->ai_next) {
+              if (ai->ai_family == AF_INET6 && !got_inet6) {
+                struct sockaddr_in6 *sa6 = (struct sockaddr_in6 *) ai->ai_addr;
+                memset(&d->c->rem, 0, sizeof(d->c->rem));
+                d->c->rem.is_ip6 = true;
+                memcpy(d->c->rem.ip6, &sa6->sin6_addr, 16);
+                d->c->rem.port   = saved_port;
+                got_inet6 = true;
+                break;
+              } else if (ai->ai_family == AF_INET && !got_inet) {
+                struct sockaddr_in *sa4 = (struct sockaddr_in *) ai->ai_addr;
+                memcpy(ipv4_bytes, &sa4->sin_addr.s_addr, 4);
+                got_inet = true;
+              }
+            }
+            freeaddrinfo(res);
+            if (!got_inet6 && got_inet) {
+              /* Synthesize NAT64 address: first 12 bytes of the configured
+               * dns6 server = /96 NAT64 prefix; last 4 bytes = IPv4 addr. */
+              const ip_addr_t *nat64_dns = dns_getserver(0);
+              if (nat64_dns != NULL && IP_IS_V6_VAL(*nat64_dns)) {
+                const ip6_addr_t *pfx = ip_2_ip6(nat64_dns);
+                memset(&d->c->rem, 0, sizeof(d->c->rem));
+                d->c->rem.is_ip6 = true;
+                memcpy(d->c->rem.ip6,      pfx->addr, 12);
+                memcpy(d->c->rem.ip6 + 12, ipv4_bytes, 4);
+                d->c->rem.port   = saved_port;
+                got_inet6 = true;
+              }
+            }
+            if (got_inet6 && d->c->is_resolving) {
+              MG_DEBUG(("%lu DNS lwip fallback: resolved %s", d->c->id, d->name));
+              mg_connect_resolved(d->c);
+              mg_dns_free(c, d);
+              fallback_ok = true;
+            }
+          }
+        }
+        if (!fallback_ok) mg_error(d->c, "DNS timeout");
+#else
+        mg_error(d->c, "DNS timeout");
+#endif
+      }
     }
   } else if (ev == MG_EV_READ) {
     struct mg_dns_message dm;
@@ -246,6 +322,12 @@ static void mg_sendnsreq(struct mg_connection *c, struct mg_str *name, int ms,
     d->expire = mg_millis() + (uint64_t) ms;
     d->c = c;
     c->is_resolving = 1;
+#ifdef MG_LWIP_DNS_FALLBACK
+    if (name->len < sizeof(d->name)) {
+      memcpy(d->name, name->ptr, name->len);
+      d->name[name->len] = '\0';
+    }
+#endif
     MG_VERBOSE(("%lu resolving %.*s @ %s, txnid %hu", c->id, (int) name->len,
                 name->ptr, mg_ntoa(&dnsc->c->rem, buf, sizeof(buf)), d->txnid));
     if (!mg_dns_send(dnsc->c, name, d->txnid, ipv6)) {
