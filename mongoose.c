@@ -23,6 +23,8 @@
  * source link-local non routable par NAT64), on reessaie via getaddrinfo()
  * de lwip qui utilise l'adresse OMR directement. Pour les hotes A-only on
  * synthetise l'adresse NAT64 depuis les 96 premiers bits du serveur dns6.
+ * Hors Thread (use_dns6 a false : WiFi, LTE, Ethernet), on demande l'IPv4
+ * et on l'utilise telle quelle.
  * IDF_VER est toujours defini dans les builds ESP-IDF. */
 #ifdef IDF_VER
 #  include "lwip/netdb.h"
@@ -262,18 +264,21 @@ bool mg_dns_parse(const uint8_t *buf, size_t len, struct mg_dns_message *dm) {
 
 #ifdef MG_LWIP_DNS_FALLBACK
 /* Resolve d->name via lwip getaddrinfo (uses OMR src addr, not link-local).
- * On success fills d->c->rem with the IPv6 address and returns true.
+ * On success fills d->c->rem with the resolved address and returns true:
+ * IPv6/NAT64 on Thread, IPv4 otherwise (use_dns6 false: the default netif
+ * has an IPv4 address, so an IPv6 one would not be reachable).
  * Caller must call mg_connect_resolved + mg_dns_free. */
 static bool mg_lwip_try_resolve(struct dns_data *d) {
   if (d->name[0] == '\0') return false;
+  bool ipv4_netif = !d->c->mgr->use_dns6;
   struct addrinfo hints, *res = NULL;
   memset(&hints, 0, sizeof(hints));
-  hints.ai_family   = AF_UNSPEC;
+  hints.ai_family   = ipv4_netif ? AF_INET : AF_UNSPEC;
   hints.ai_socktype = SOCK_STREAM;
   if (getaddrinfo(d->name, NULL, &hints, &res) != 0 || res == NULL) return false;
   uint16_t saved_port = d->c->rem.port;
   struct addrinfo *ai;
-  uint8_t ipv4_bytes[4];
+  uint8_t ipv4_bytes[4] = {0};
   bool got_inet6 = false, got_inet = false;
   for (ai = res; ai != NULL; ai = ai->ai_next) {
     if (ai->ai_family == AF_INET6 && !got_inet6) {
@@ -291,6 +296,16 @@ static bool mg_lwip_try_resolve(struct dns_data *d) {
     }
   }
   freeaddrinfo(res);
+  if (ipv4_netif) {
+    if (!got_inet || !d->c->is_resolving) return false;
+    memset(&d->c->rem, 0, sizeof(d->c->rem));
+    memcpy(&d->c->rem.ip, ipv4_bytes, 4);
+    d->c->rem.port = saved_port;
+    MG_ERROR(("%lu DNS lwip fallback: %s -> %u.%u.%u.%u:%u",
+              d->c->id, d->name, ipv4_bytes[0], ipv4_bytes[1], ipv4_bytes[2],
+              ipv4_bytes[3], (unsigned) mg_ntohs(d->c->rem.port)));
+    return true;
+  }
   if (!got_inet6 && got_inet) {
     const ip_addr_t *nat64_dns = dns_getserver(0);
     if (nat64_dns != NULL && IP_IS_V6_VAL(*nat64_dns)) {
